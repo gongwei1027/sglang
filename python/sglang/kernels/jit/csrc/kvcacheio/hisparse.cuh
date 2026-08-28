@@ -35,6 +35,9 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
 // 128-bit vector type used by the wide copy path below.
 using TransferVec4 = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
 
+// WaveSplit is a CUDA-only mitigation (see the non-ROCm branch); the parameter
+// exists so callers stay warp-shape agnostic and is ignored here.
+template <bool WaveSplit = false>
 __device__ __forceinline__ void transfer_item_warp(
     int32_t lane_id, const void* __restrict__ src_addr, void* __restrict__ dst_addr, int64_t item_size_bytes) {
   const auto src = static_cast<const char*>(src_addr);
@@ -137,6 +140,51 @@ __device__ __forceinline__ void transfer_dsv4_item_warp(
   }
 }
 #else
+// WaveSplit reshapes the strided loop below without changing which bytes move.
+// It exists because on sm_100/sm_120 the flat-queue copy_cache_planned_kernel
+// collapses 12x for any item_size_bytes that is not a multiple of 64 -- 656B
+// (GLM-5.2 NVFP4 + fp8 KV) takes 1905us where 640B takes 112us.
+//
+// What the sweep established (bs=4, 8192 items, grid 4 x 1024, sm_120):
+//
+//   safe   512 576 640 704 768 1024 1536 2048   (all % 64 == 0)  0.70-1.04x
+//   cliff  528 656 672 1168                     (all % 64 != 0)  6.6-12.8x
+//
+// The trigger is the shape of the loop's last iteration, not the bytes. A warp
+// moves 32 * 16B = 512B per iteration, so the final iteration runs with only
+// (total_pairs % 32) lanes enabled. When that partial iteration also moves a
+// non-multiple of 64B (41 pairs -> 9 lanes -> 144B = 2x64 + 16) the copy ends
+// with two stacked irregularities and the schedule falls apart; 40 lanes -> 8
+// lanes -> 128B is clean and fast. Splitting 656B into a 640B loop plus a 16B
+// tail does NOT help (still two irregular phases, 2074us), while splitting 528B
+// into a 32-pair loop plus a 16B tail does (155us) -- same memory operations,
+// 12x apart, so this is loop structure and nothing else.
+//
+// WaveSplit therefore makes the strided loop cover only whole warp waves and
+// handles the single remainder wave once, outside it: exactly one irregular
+// phase for every stride. Measured: 656B 1905 -> 153.6us, 672B 2034 -> 153us,
+// 528B 1828 -> 145us, 592B 1885 -> 152us, with no cliff left anywhere.
+//
+// It is not a free win, which is why it is opt-in rather than the default. The
+// single-loop form lets ptxas batch 8 loads before the first store on sm_100+
+// (`LLLLLLLLSSSS...`, vs `LLLLLSLLSS...` for 5), and that deeper batch is worth
+// 1.3-1.4x when the stride is well-shaped -- 640B regresses 112 -> 151us under
+// WaveSplit. Callers must only enable it for the strides that actually collapse.
+//
+// Ruled out by measurement, so future readers do not re-derive them: extra
+// sectors (+10% only, and L2 read traffic does not grow), LSU/queue congestion
+// (mio/lg throttle, barrier and drain counters are all 0), a read-modify-write
+// fill for the partial 64B store (a store-only kernel carries every partial
+// write for 43us), and base-address alignment (padding the host and device row
+// strides to 704 while still copying 656B stays at 1789us). What remains is a
+// pure latency effect: identical stall type (long_scoreboard) at an identical
+// sample rate, lasting 7.6x longer, i.e. host reads stop overlapping.
+//
+// sm_90 and below are unaffected: the copy compiles to the same schedule there
+// for both the flat and the per-request outer loop, which is why this never
+// showed up on H200. The specialization is #if'd out for those arches so their
+// SASS is untouched.
+template <bool WaveSplit = false>
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
   // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
@@ -144,13 +192,36 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
   {
     const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
     uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
-    for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
+
+    // Whole warp waves only when WaveSplit; the ragged wave is peeled off below.
+    int bulk_pairs = total_pairs;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    if constexpr (WaveSplit) {
+      bulk_pairs = (total_pairs / WARP_SIZE) * WARP_SIZE;
+    }
+#endif
+
+    for (int j = lane_id; j < bulk_pairs; j += WARP_SIZE) {
       uint64_t lo, hi;
       const uint64_t* s = src + j * 2;
       asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
       uint64_t* d = dst + j * 2;
       asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
     }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    if constexpr (WaveSplit) {
+      // The one remainder wave, straight-line instead of a final ragged trip.
+      const int j = bulk_pairs + lane_id;
+      if (j < total_pairs) {
+        uint64_t lo, hi;
+        const uint64_t* s = src + j * 2;
+        asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
+        uint64_t* d = dst + j * 2;
+        asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
+      }
+    }
+#endif
   }
 
   // Tail: 64-bit for remaining 8-byte chunk (if item_size not multiple of 16)
@@ -176,7 +247,9 @@ __device__ __forceinline__ int popc_mask(BallotMask mask) {
 
 // Copy one missed item host->device with one warp. Shared by the fused swap-in
 // kernel and copy_cache_planned_kernel so the layout dispatch cannot drift.
-template <bool IsMLA, bool IsDsv4Layout>
+// WaveSplit is threaded through to transfer_item_warp; see its comment for when
+// callers should turn it on.
+template <bool IsMLA, bool IsDsv4Layout, bool WaveSplit = false>
 __device__ __forceinline__ void copy_miss_item(
     int32_t lane_id,
     const void* __restrict__ host_cache_k,
@@ -213,12 +286,12 @@ __device__ __forceinline__ void copy_miss_item(
     // Generic path: device + host both linear, stride = item_size_bytes.
     const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
     auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
-    transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
+    transfer_item_warp<WaveSplit>(lane_id, src_k, dst_k, item_size_bytes);
 
     if constexpr (!IsMLA) {
       const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
       auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
-      transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+      transfer_item_warp<WaveSplit>(lane_id, src_v, dst_v, item_size_bytes);
     }
   }
 }
@@ -838,7 +911,11 @@ void load_cache_to_device_buffer(
 // miss plan (no hit detection / LRU; the anchor's slot table stays valid). The
 // small fixed grid (num_blocks) keeps the SM footprint low while overlapping
 // compute on a side stream. SkipIO is the same probe as in the fused kernel.
-template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO>
+//
+// WaveSplit is the sm_100+ mitigation described on transfer_item_warp. This
+// kernel is where the collapse was found, so it is the one caller that turns it
+// on, and only for the strides that need it (see the launcher below).
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO, bool WaveSplit = false>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
     const int64_t* __restrict__ miss_src_locs,
     const int32_t* __restrict__ miss_dst_locs,
@@ -876,7 +953,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
       for (int m = m0; m < cnt; m += total_warps) {
         // Timing probe: the plan is still walked; only the bytes stay put.
         if constexpr (SkipIO) continue;
-        copy_miss_item<IsMLA, IsDsv4Layout>(
+        copy_miss_item<IsMLA, IsDsv4Layout, WaveSplit>(
             lane_id,
             host_cache_k,
             host_cache_v,
@@ -909,18 +986,48 @@ void copy_cache_planned(
     throw std::runtime_error("copy_cache_planned: miss_src/miss_dst row strides differ");
   }
   const auto device = LaunchKernel::resolve_device(miss_src_locs.device());
-  LaunchKernel(num_blocks, BLOCK_SIZE, device)(
-      copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout, SkipIO>,
-      static_cast<const int64_t*>(miss_src_locs.data_ptr()),
-      static_cast<const int32_t*>(miss_dst_locs.data_ptr()),
-      static_cast<const int32_t*>(miss_counts.data_ptr()),
-      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-      host_cache_k.data_ptr(),
-      (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
-      device_buffer_k.data_ptr(),
-      (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
-      plan_stride,
-      item_size_bytes);
+  auto launch = [&](auto kernel_fn) {
+    LaunchKernel(num_blocks, BLOCK_SIZE, device)(
+        kernel_fn,
+        static_cast<const int64_t*>(miss_src_locs.data_ptr()),
+        static_cast<const int32_t*>(miss_dst_locs.data_ptr()),
+        static_cast<const int32_t*>(miss_counts.data_ptr()),
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        host_cache_k.data_ptr(),
+        (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+        device_buffer_k.data_ptr(),
+        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+        plan_stride,
+        item_size_bytes);
+  };
+
+  // Select the copy body. Strides whose ragged wave is well-shaped keep the
+  // original single loop -- it is 1.3-1.4x faster there because ptxas batches
+  // more loads per store. Only the strides that collapse pay for the reshaped
+  // loop. The DSv4 layout copies through device::hisparse::transfer_item on
+  // CUDA, so WaveSplit does not reach it and there is nothing to select.
+  //
+  // The condition is a property of transfer_item_warp's LOOP SHAPE, not of the
+  // stride on its own, so it is written in wave terms rather than as
+  // `item_size_bytes % 64` (equivalent for the 16B-aligned strides in use, but
+  // it states its own premise). A wave moves WARP_SIZE * 16B, so the loop's last
+  // iteration runs with (total_pairs % WARP_SIZE) lanes; WaveSplit is only worth
+  // its cost when that ragged wave is itself not a multiple of 64B. Re-measure
+  // if either this loop or the kernel's outer mapping changes -- the same 528B
+  // is 1828us as one ragged loop and 155us once the loop is restructured.
+  // Strides that are not 16B-aligned also run the 8B tail below the loop, adding
+  // a phase this criterion does not model; none are measured, and no model in
+  // use produces one (every KV item is a whole number of 2-byte elements).
+#if !defined(USE_ROCM)
+  if constexpr (!IsDsv4Layout) {
+    const int64_t ragged_wave_bytes = ((item_size_bytes / 16) % WARP_SIZE) * 16;
+    if (ragged_wave_bytes % 64 != 0) {
+      launch(copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout, SkipIO, /*WaveSplit=*/true>);
+      return;
+    }
+  }
+#endif
+  launch(copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout, SkipIO, /*WaveSplit=*/false>);
 }
 
 }  // namespace sglang
